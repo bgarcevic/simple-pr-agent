@@ -1,0 +1,64 @@
+parameters:
+  - name: model
+    displayName: OpenCode model
+    type: string
+    default: 'openai/gpt-5.4-mini'
+
+trigger: none
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - checkout: self
+    fetchDepth: 0
+    persistCredentials: true
+
+  - bash: |
+      set -euo pipefail
+
+      curl -fsSL https://opencode.ai/install | bash
+      OPENCODE="$HOME/.opencode/bin/opencode"
+
+      echo "##vso[task.prependpath]$(dirname "$OPENCODE")"
+      "$OPENCODE" --version
+    displayName: Install OpenCode
+
+  - bash: |
+      set -euo pipefail
+
+      target_branch_name="main"
+      echo "Reviewing changes against origin/$target_branch_name."
+
+      git fetch --no-tags origin "$target_branch_name"
+
+      opencode_cmd=$(printf 'opencode run --format json --agent plan --command review --model %q --variant high --thinking true --log-level WARN -- %q' "$OPENCODE_MODEL" "origin/$target_branch_name")
+
+      raw_output_file="$(mktemp)"
+      set +e
+      script -q -e -c "$opencode_cmd" /dev/null | tee "$raw_output_file"
+      opencode_status=${PIPESTATUS[0]}
+      set -e
+
+      if [ -n "${SYSTEM_PULLREQUEST_PULLREQUESTID:-}" ]; then
+        payload_file="$(mktemp)"
+        python3 ./.devops/scripts/extract-opencode-review-text.py "$raw_output_file" "$payload_file"
+
+        comment_url="${SYSTEM_COLLECTIONURI}${SYSTEM_TEAMPROJECT}/_apis/git/repositories/${BUILD_REPOSITORY_ID}/pullRequests/${SYSTEM_PULLREQUEST_PULLREQUESTID}/threads?api-version=7.1"
+        if ! curl -fsS -X POST \
+          -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN:-}" \
+          -H "Content-Type: application/json" \
+          --data-binary "@$payload_file" \
+          "$comment_url"; then
+          echo "WARNING: Review completed, but posting the PR comment failed."
+        fi
+      fi
+
+      exit "$opencode_status"
+    displayName: Run PR AI review
+    env:
+      OPENAI_API_KEY: $(OPENAI_API_KEY)
+      OPENCODE_MODEL: ${{ parameters.model }}
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+      OPENCODE_DISABLE_MODELS_FETCH: '1'
+      OPENCODE_DISABLE_AUTOUPDATE: '1'
